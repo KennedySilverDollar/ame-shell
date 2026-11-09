@@ -13,19 +13,19 @@
 // (全面アンカーのサーフェスには排他領域を設定できないため)。
 const std = @import("std");
 
-const anim = @import("../anim.zig");
+const anim = @import("../gfx/anim.zig");
 const Spring = anim.Spring;
 const Color = anim.Color;
-const appmod = @import("../app.zig");
+const appmod = @import("../core/app.zig");
 const App = appmod.App;
 const Output = appmod.Output;
 const c = @import("../c.zig");
-const gfx = @import("../gfx.zig");
+const gfx = @import("../gfx/gfx.zig");
 const loop = @import("../platform/loop.zig");
 const sys = @import("../platform/sys.zig");
-const surface = @import("../surface.zig");
+const surface = @import("../core/surface.zig");
 const Surface = surface.Surface;
-const theme = @import("../theme.zig");
+const theme = @import("../gfx/theme.zig");
 const dash = @import("dash.zig");
 const data = @import("data.zig");
 const netpanel = @import("netpanel.zig");
@@ -328,10 +328,18 @@ pub const Frame = struct {
             aipanel.onOpen(self);
         }
         self.afterOpenChange();
-        @import("../ime.zig").update(self.app);
+        @import("../desktop/ime.zig").update(self.app);
     }
-    /// キーボードがこの枠に来た: AI チャットの「開いた直後の排他」を解く
+    /// キーボードがこの枠に来た。River 0.3(WM が別)では、ここで AI チャットの「開いた直後の排他」を解く
+    /// (窓のクリックを知る手段が無いため)。River 0.5 では解かない: 解くと River がキーボードを
+    /// 元の窓へ戻してしまい、パネルに打てない・日本語入力が効かない(入力メソッドが窓の方へ行く)
     pub fn keyboardEntered(self: *Frame) void {
+        if (self.app.wm != null) return;
+        self.releaseAiGrab();
+    }
+    /// ほかの窓が押された(River 0.5 の WM から): AI チャットの排他を解き、その窓に入力できるようにする。
+    /// パネルを開いたままでも、もう一度パネルを押せばまた打てる(on_demand)
+    pub fn releaseAiGrab(self: *Frame) void {
         if (!self.ai_grab) return;
         self.ai_grab = false;
         self.updateKeyboard();

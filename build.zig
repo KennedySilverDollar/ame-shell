@@ -77,6 +77,7 @@ pub fn build(b: *std.Build) void {
     // ディレクトリ引数は中身の変更を追跡しないため、ソースを明示的に入力に加える。
     odin.addFileInput(b.path("anim/anim.odin"));
     odin.addFileInput(b.path("anim/fft.odin"));
+    odin.addFileInput(b.path("anim/image.odin"));
 
     // --- wasm3: WASM ウィジェットの実行ランタイム(C, MIT) ---
     const wasm3_files = [_][]const u8{
@@ -181,7 +182,7 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(ctl);
 
-    const cmds = [_][]const u8{"ame-lyrics"};
+    const cmds = [_][]const u8{ "ame-lyrics", "ame-ai", "ame-agent", "ame-config", "ame-weather", "ame-airpods", "ame-handtrack", "ame-keyring" };
     // --- 画面を持たない小さな道具(標準入出力でやりとりする。src/cmd/。libc だけ)---
     for (cmds) |name| {
         const t = b.addExecutable(.{
@@ -192,6 +193,10 @@ pub fn build(b: *std.Build) void {
             .strip = strip,
         });
         t.root_module.addImport("ame_lib", lib_mod);
+        // ame-handtrack だけは手の認識(ame-hand)を使う
+        if (std.mem.eql(u8, name, "ame-handtrack")) t.root_module.addImport("ame-hand", hand_dep.module("ame-hand"));
+        // ame-keyring だけは D-Bus(libdbus。ame-shell 本体と同じもの)を使う
+        if (std.mem.eql(u8, name, "ame-keyring")) useDbus(b, t, sr, pre, bsd);
         t.linkLibC();
         b.installArtifact(t);
     }
@@ -219,7 +224,9 @@ pub fn build(b: *std.Build) void {
     odin_wasm.addArgs(&.{ "-build-mode:obj", "-no-entry-point", "-o:size", "-no-bounds-check", "-default-to-nil-allocator", "-target:freestanding_wasm32" });
     const anim_wasm = odin_wasm.addPrefixedOutputFileArg("-out:", "anim_wasm.o");
     odin_wasm.addFileInput(b.path("anim/anim.odin"));
-    const abi_mod = b.createModule(.{ .root_source_file = b.path("src/widget_abi.zig") });
+    odin_wasm.addFileInput(b.path("anim/fft.odin"));
+    odin_wasm.addFileInput(b.path("anim/image.odin"));
+    const abi_mod = b.createModule(.{ .root_source_file = b.path("src/widget/widget_abi.zig") });
     const wasm_target = b.resolveTargetQuery(.{ .cpu_arch = .wasm32, .os_tag = .freestanding });
     for ([_][]const u8{ "clock", "sysmon", "media", "calendar", "controls" }) |name| {
         const w = b.addExecutable(.{
@@ -318,12 +325,37 @@ pub fn build(b: *std.Build) void {
     tests.root_module.addImport("ame_lib", lib_mod);
     tests.linkLibC();
     const test_step = b.step("test", "純粋ロジックのテスト");
+    // 書式もそろっているか(zig fmt --check)。そろっていなければ zig fmt <ファイル> で直す
+    test_step.dependOn(&b.addFmt(.{ .paths = &.{ "src", "tools", "widgets", "site/src", "site/gen", "build.zig" }, .check = true }).step);
     test_step.dependOn(&b.addRunArtifact(tests).step);
+    // 部品(src/lib)のテスト。名前付きのモジュールのテストは読み込む側からは走らないので、別に走らせる
+    const lt = b.addTest(.{ .root_source_file = b.path("src/lib/lib.zig"), .target = target, .optimize = optimize });
+    lt.linkLibC();
+    test_step.dependOn(&b.addRunArtifact(lt).step);
     // 小さな道具のテスト(引数の読み方など)
     for (cmds) |name| {
         const ct = b.addTest(.{ .root_source_file = b.path(b.fmt("src/cmd/{s}.zig", .{name})), .target = target, .optimize = optimize });
         ct.root_module.addImport("ame_lib", lib_mod);
+        if (std.mem.eql(u8, name, "ame-handtrack")) ct.root_module.addImport("ame-hand", hand_dep.module("ame-hand"));
+        if (std.mem.eql(u8, name, "ame-keyring")) useDbus(b, ct, sr, pre, bsd);
         ct.linkLibC();
         test_step.dependOn(&b.addRunArtifact(ct).step);
     }
+}
+
+/// libdbus を使う(ヘッダの場所は ame-shell 本体と同じ。FreeBSD は pkg-config を使わない)
+fn useDbus(b: *std.Build, step: *std.Build.Step.Compile, sr: []const u8, pre: []const u8, bsd: bool) void {
+    for ([_][]const u8{ "/include/dbus-1.0", "/lib/dbus-1.0/include" }) |p| {
+        step.addIncludePath(.{ .cwd_relative = b.fmt("{s}{s}{s}", .{ sr, pre, p }) });
+    }
+    if (bsd) {
+        step.addIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/local/include", .{sr}) });
+        step.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/local/lib", .{sr}) });
+        if (sr.len > 0) {
+            step.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{sr}) });
+            step.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sr}) });
+            step.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/lib", .{sr}) });
+        }
+        step.linkSystemLibrary2("dbus-1", .{ .use_pkg_config = .no });
+    } else step.linkSystemLibrary("dbus-1");
 }

@@ -3,16 +3,17 @@
 //   OSD(右中央、音量・明るさの縦スライダー)/ バーのポップアウト(左)
 const std = @import("std");
 const c = @import("../c.zig");
-const anim = @import("../anim.zig");
+const anim = @import("../gfx/anim.zig");
 const Spring = anim.Spring;
 const Color = anim.Color;
-const gfx = @import("../gfx.zig");
-const theme = @import("../theme.zig");
-const surface = @import("../surface.zig");
+const gfx = @import("../gfx/gfx.zig");
+const theme = @import("../gfx/theme.zig");
+const surface = @import("../core/surface.zig");
 const sys = @import("../platform/sys.zig");
 const netdbus = @import("../platform/netdbus.zig");
 const data = @import("data.zig");
 const vbar = @import("vbar.zig");
+const notify = @import("../desktop/notify.zig");
 const Frame = @import("frame.zig").Frame;
 
 pub const Which = enum { dashboard, launcher, notifs, utilities, sidebar, session, osd, popout, net, ai };
@@ -93,10 +94,11 @@ fn drawNotifs(f: *Frame, cv: *gfx.Canvas, w: f32) bool {
         const cw = w - 20;
         cv.rect(x, y, cw, n.height, 14, Color.hex(0xffffff).alpha(0.05 + 0.04 * hv));
         cv.rectGrad(x + 8, y + 12, 3, n.height - 24, 1.5, col.lighten(0.3), col);
-        _ = cv.text(x + 20, y + 24, 12, col, n.appName(), .{ .bold = true, .max_w = cw - 100 });
+        const tx: f32 = if (notify.drawIcon(app, n, cv, x + 18, y + 16, 38)) 66 else 20;
+        _ = cv.text(x + tx, y + 24, 12, col, n.appName(), .{ .bold = true, .max_w = cw - tx - 80 });
         _ = cv.text(x + cw - 12, y + 24, 11.5, sub, n.time_str[0..5], .{ .alignment = .right });
-        _ = cv.text(x + 20, y + 47, 15, txt, n.summaryText(), .{ .bold = true, .max_w = cw - 34 });
-        if (n.body_len > 0) cv.textWrap(x + 20, y + 69, 13, sub, n.bodyText(), cw - 34, 2, 18);
+        _ = cv.text(x + tx, y + 47, 15, txt, n.summaryText(), .{ .bold = true, .max_w = cw - tx - 14 });
+        if (n.body_len > 0) cv.textWrap(x + tx, y + 69, 13, sub, n.bodyText(), cw - tx - 14, 2, 18);
         cv.restore();
     }
     return false;
@@ -114,7 +116,7 @@ const N_BIG = 8;
 fn utilButtons(f: *Frame) [N_UTIL]struct { b: UtilBtn, icon: []const u8, label: []const u8, on: bool } {
     const d = f.app.dashboard;
     const hand_on = @import("../hand/hand.zig").enabled();
-    const ap_on = @import("../airpods.zig").enabled();
+    const ap_on = @import("../device/airpods.zig").enabled();
     return .{
         .{ .b = .wifi, .icon = "\u{F05A9}", .label = "Wi-Fi", .on = d.store.wifi_on != 0 },
         .{ .b = .bt, .icon = "\u{F00AF}", .label = "Bluetooth", .on = d.store.bt_on != 0 },
@@ -154,13 +156,13 @@ fn drawUtil(f: *Frame, cv: *gfx.Canvas, w: f32) bool {
     const st = &app.sys;
     var buf: [160]u8 = undefined;
     var tb: [48]u8 = undefined;
-    const bt = @import("../bar.zig").batteryTime(&tb, st.battery);
+    const bt = @import("../desktop/bar.zig").batteryTime(&tb, st.battery);
     // 「バッテリー 46%」(太字)+ 状態と残り時間(細字)。放電中は状態の言葉を省いて時間だけ
     const bat = if (st.battery.present) (std.fmt.bufPrint(&buf, "バッテリー {d}%", .{st.battery.percent}) catch "") else "バッテリーなし";
     const bx = 16 + cv.text(16, 28, 13, txt, bat, .{ .bold = true }) + 10;
     if (st.battery.present) {
         var db: [96]u8 = undefined;
-        const state = if (st.battery.on_ac or st.battery.percent <= 10) @import("../bar.zig").batteryState(st.battery) else "";
+        const state = if (st.battery.on_ac or st.battery.percent <= 10) @import("../desktop/bar.zig").batteryState(st.battery) else "";
         const detail = std.fmt.bufPrint(&db, "{s}{s}{s}", .{ state, if (state.len > 0 and bt.len > 0) "・" else "", bt }) catch "";
         _ = cv.text(bx, 28, 11.5, if (st.battery.charging) theme.accent(app) else sub, detail, .{ .max_w = w - 16 - bx });
     } else _ = cv.text(w - 16, 28, 11.5, sub, "ユーティリティ", .{ .alignment = .right });
@@ -216,10 +218,10 @@ fn utilPress(f: *Frame, i: usize) void {
         .screenshot => {
             f.closeAll();
             // パネルが閉じ終わってから範囲を選ぶ(保存してコピー。足りないコマンドは通知で知らせる)
-            @import("../shot.zig").take(app, .region, 400);
+            @import("../desktop/shot.zig").take(app, .region, 400);
         },
         .hand => @import("../hand/hand.zig").toggle(app),
-        .airpods => @import("../airpods.zig").toggle(app),
+        .airpods => @import("../device/airpods.zig").toggle(app),
         .saver => data.setPowerProfile(.saver),
         .balanced => data.setPowerProfile(.balanced),
         .perf => data.setPowerProfile(.performance),
@@ -251,14 +253,16 @@ fn drawSidebar(f: *Frame, cv: *gfx.Canvas, w: f32, h: f32) bool {
         _ = cv.text(w / 2, h / 2 + 24, 14, sub, "通知はありません", .{ .alignment = .center });
         return false;
     }
-    for (hist) |n| {
+    for (hist, 0..) |*n, i| {
         if (y > h) break;
         if (y + 70 > 50) {
-            cv.rect(12, y, w - 24, 66, 14, Color.hex(0xffffff).alpha(0.05));
-            _ = cv.text(26, y + 21, 11.5, acc, n.appName(), .{ .bold = true, .max_w = w - 110 });
+            const hv: f32 = if (f.sidev.hover == 200 + @as(i32, @intCast(i))) 1 else 0;
+            cv.rect(12, y, w - 24, 66, 14, Color.hex(0xffffff).alpha(0.05 + 0.05 * hv));
+            const tx: f32 = if (notify.drawIcon(app, n, cv, 22, y + 15, 36)) 68 else 26;
+            _ = cv.text(tx, y + 21, 11.5, acc, n.appName(), .{ .bold = true, .max_w = w - tx - 84 });
             _ = cv.text(w - 26, y + 21, 11, sub, n.time_str[0..5], .{ .alignment = .right });
-            _ = cv.text(26, y + 41, 14, txt, n.summaryText(), .{ .bold = true, .max_w = w - 52 });
-            _ = cv.text(26, y + 58, 12, sub, n.bodyText(), .{ .max_w = w - 52 });
+            _ = cv.text(tx, y + 41, 14, txt, n.summaryText(), .{ .bold = true, .max_w = w - tx - 26 });
+            _ = cv.text(tx, y + 58, 12, sub, n.bodyText(), .{ .max_w = w - tx - 26 });
         }
         y += 74;
     }
@@ -412,6 +416,14 @@ pub fn pointer(f: *Frame, which: Which, ev: surface.PointerEvent, lx: f32, ly: f
             const w = f.side.w.x;
             if (ly >= 14 and ly < 42 and lx >= w - 112 and lx < w - 16) hov = 100;
             if (ly >= 14 and ly < 42 and lx >= w - 160 and lx < w - 120) hov = 101;
+            // 通知の行(58 から 74 ずつ、高さ 66)
+            if (ly >= 50) {
+                const ry = ly - 58 + st.scroll;
+                if (ry >= 0) {
+                    const k: i32 = @intFromFloat(ry / 74);
+                    if (ry - @as(f32, @floatFromInt(k)) * 74 < 66 and k < app.notifs.history.items.len) hov = 200 + k;
+                }
+            }
         },
         .osd => {
             const n: f32 = if (app.sys.brightness != null) 2 else 1;
@@ -427,6 +439,7 @@ pub fn pointer(f: *Frame, which: Which, ev: surface.PointerEvent, lx: f32, ly: f
         .press => switch (which) {
             .notifs => if (hov >= 0) {
                 const n = app.notifs.active.items[@intCast(hov)];
+                if (ev.button == 0x110) app.notifs.open(&n);
                 app.notifs.dismiss(n.id, 2);
             },
             .utilities => if (hov >= 0) utilPress(f, @intCast(hov)),
@@ -434,6 +447,11 @@ pub fn pointer(f: *Frame, which: Which, ev: surface.PointerEvent, lx: f32, ly: f
             .sidebar => {
                 if (hov == 100) app.notifs.clearAll();
                 if (hov == 101) app.dashboard.dnd = !app.dashboard.dnd;
+                if (hov >= 200) {
+                    const n = app.notifs.history.items[@intCast(hov - 200)];
+                    f.toggleSidebar();
+                    app.notifs.open(&n);
+                }
             },
             .osd => if (hov >= 0) {
                 st.osd_drag = hov;
@@ -485,7 +503,7 @@ fn toggleRecord(f: *Frame) void {
     var p: [512]u8 = undefined;
     const script = std.fmt.bufPrintZ(&p, "{s}/.local/bin/toggle-record.sh", .{home}) catch return;
     if (c.access(script.ptr, c.X_OK) == 0) {
-        sys.spawnDetached(script.ptr);
+        sys.spawnDetachedArgs("exec \"$1\"", &.{script.ptr}); // パスは文に埋め込まない
         f.sidev.recording = !f.sidev.recording;
         return;
     }
@@ -515,8 +533,10 @@ fn toggleRecord(f: *Frame) void {
     // 音も録る: 既定の出力(スピーカー)で鳴っている音。PipeWire ではスピーカーの名前をそのまま、
     // PulseAudio(FreeBSD)では <名前>.monitor を録る。pactl が無ければ既定の入力(-a)
     var cmd: [900]u8 = undefined;
-    const cmdz = std.fmt.bufPrintZ(&cmd, "s=$(pactl get-default-sink 2>/dev/null); if [ -z \"$s\" ]; then set -- -a; elif pactl info 2>/dev/null | grep -q PipeWire; then set -- \"--audio=$s\"; else set -- --audio-backend=pulse \"--audio=$s.monitor\"; fi; exec wf-recorder \"$@\" -f '{s}' >/dev/null 2>&1", .{path}) catch return;
-    sys.spawnDetached(cmdz.ptr);
+    const cmdz = std.fmt.bufPrintZ(&cmd, "F=\"$1\"; s=$(pactl get-default-sink 2>/dev/null); if [ -z \"$s\" ]; then set -- -a; elif pactl info 2>/dev/null | grep -q PipeWire; then set -- \"--audio=$s\"; else set -- --audio-backend=pulse \"--audio=$s.monitor\"; fi; exec wf-recorder \"$@\" -f \"$F\" >/dev/null 2>&1", .{}) catch return;
+    // 保存先は文に埋め込まず引数で渡す(sh -c の $1 → F)
+    var pz: [520]u8 = undefined;
+    sys.spawnDetachedArgs(cmdz.ptr, &.{(std.fmt.bufPrintZ(&pz, "{s}", .{path}) catch return).ptr});
     f.sidev.recording = true;
     f.app.notifs.post("ame-shell", "録画を開始しました(もう一度押すと停止)", path, 0);
 }

@@ -93,6 +93,14 @@ if [ "${AME_SESSION_NESTED:-0}" != "1" ]; then
     }
     # 実装(-gtk・-wlr)は xdg-desktop-portal が D-Bus で必要なときに起動する
     p=$(find_bin xdg-desktop-portal) && "$p" >/dev/null 2>&1 &
+
+    # ---- 鍵束(org.freedesktop.secrets。ame-keyring)----
+    # Zed などのアプリは API キー・パスワードをここにしまう。無いとしまえず、再起動のたびに消える。
+    # ほかの鍵束(gnome-keyring など)や前のセッションの ame-keyring が動いていれば、何もせずに終わる
+    if command -v ame-keyring >/dev/null 2>&1; then
+        ame-keyring >/dev/null 2>>"$LOG" &
+        log "keyring: ame-keyring"
+    fi
 fi
 
 # ユーザーの自動起動(~/.config/ame-shell/autostart。例は share/ame-shell/examples/autostart)。

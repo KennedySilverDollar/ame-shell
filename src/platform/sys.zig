@@ -382,6 +382,18 @@ pub fn childDefaults() void {
 }
 
 pub fn spawnDetached(cmdline: [*:0]const u8) void {
+    spawnDetachedArgs(cmdline, &.{});
+}
+
+/// /bin/sh -c <script> sh <args…> で切り離して動かす。パスなどの値は script に埋め込まず args で渡し、
+/// script の中では "$1" "$2" … で読む(値に ' や $ が入っていてもシェルの文として解釈されない)
+pub fn spawnDetachedArgs(cmdline: [*:0]const u8, args: []const [*:0]const u8) void {
+    var argv: [12:null]?[*:0]const u8 = .{null} ** 12;
+    argv[0] = "/bin/sh";
+    argv[1] = "-c";
+    argv[2] = cmdline;
+    argv[3] = "sh";
+    for (args[0..@min(args.len, 8)], 0..) |a, i| argv[4 + i] = a;
     const pid = c.fork();
     if (pid < 0) return;
     if (pid == 0) {
@@ -391,7 +403,6 @@ pub fn spawnDetached(cmdline: [*:0]const u8) void {
         var sigset: c.sigset_t = undefined;
         _ = c.sigemptyset(&sigset);
         _ = c.sigprocmask(c.SIG_SETMASK, &sigset, null);
-        const argv = [_:null]?[*:0]const u8{ "/bin/sh", "-c", cmdline, null };
         childDefaults();
         _ = c.execv("/bin/sh", @ptrCast(&argv));
         c._exit(127);
@@ -620,4 +631,18 @@ test "doc portal broken" {
     try std.testing.expect(docPortalBroken(rd)); // 外れている
     try tmp.dir.makePath("doc/by-app");
     try std.testing.expect(!docPortalBroken(rd)); // 正常
+}
+
+/// Unix ソケットの相手のプロセスの実 UID(Linux は SO_PEERCRED、FreeBSD は getpeereid)。分からなければ null
+pub fn peerUid(fd: c_int) ?u32 {
+    if (builtin.os.tag == .freebsd) {
+        var uid: c.uid_t = 0;
+        var gid: c.gid_t = 0;
+        if (c.getpeereid(fd, &uid, &gid) != 0) return null;
+        return @intCast(uid);
+    }
+    var cred: c.struct_ucred = undefined;
+    var len: c.socklen_t = @sizeOf(c.struct_ucred);
+    if (c.getsockopt(fd, c.SOL_SOCKET, c.SO_PEERCRED, &cred, &len) != 0) return null;
+    return @intCast(cred.uid);
 }

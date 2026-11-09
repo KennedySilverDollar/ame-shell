@@ -16,10 +16,10 @@
 // manage sequence を起こしてから処理する。
 const std = @import("std");
 
-const anim = @import("../anim.zig");
+const anim = @import("../gfx/anim.zig");
 const Spring = anim.Spring;
 const Color = anim.Color;
-const appmod = @import("../app.zig");
+const appmod = @import("../core/app.zig");
 const App = appmod.App;
 const c = @import("../c.zig");
 const MOD_SHIFT = c.RIVER_SEAT_V1_MODIFIERS_SHIFT;
@@ -28,7 +28,7 @@ const MOD_ALT = c.RIVER_SEAT_V1_MODIFIERS_MOD1;
 const MOD_SUPER = c.RIVER_SEAT_V1_MODIFIERS_MOD4;
 const loop = @import("../platform/loop.zig");
 const sys = @import("../platform/sys.zig");
-const theme = @import("../theme.zig");
+const theme = @import("../gfx/theme.zig");
 const binds = @import("binds.zig");
 const wobble = @import("wobble.zig");
 
@@ -204,6 +204,8 @@ pub const Action = union(enum) {
     // 外部から(バー・ame-ctl)
     set_tags_on: struct { out: ?*WOut, mask: u32 },
     focus_window: *Window,
+    /// その窓のワークスペースへ移ってフォーカスする(通知を押したとき)
+    show_window: *Window,
     // ハンド操作(hand/hand.zig): River のポインタ操作を使わず、手の動いた量で窓を動かす
     hand_grab,
     hand_drag: struct { dx: i32, dy: i32, scale: f32 = 1 },
@@ -351,6 +353,24 @@ pub const Wm = struct {
 
     fn seat(self: *Wm) ?*WSeat {
         return if (self.seats.items.len > 0) self.seats.items[0] else null;
+    }
+
+    /// 名前(通知の desktop-entry・アプリ名)に合う窓のワークスペースへ移ってフォーカスする。見つからなければ false。
+    /// 同じアプリの窓が複数あれば、今見えているもの → 最後に開いたもの
+    pub fn focusApp(self: *Wm, names: []const []const u8) bool {
+        const appid = @import("ame_lib").appid;
+        var best: ?*Window = null;
+        for (names) |n| {
+            for (self.windows.items) |w| {
+                if (w.closing or !appid.matches(w.app_id[0..w.app_id_len], n)) continue;
+                const visible = if (w.out) |oo| oo.tags & w.tags != 0 else false;
+                if (best == null or visible) best = w;
+                if (visible) break;
+            }
+            if (best != null) break;
+        }
+        self.push(.{ .show_window = best orelse return false });
+        return true;
     }
 
     pub fn focusedWindow(self: *Wm) ?*Window {
@@ -539,7 +559,7 @@ pub const Wm = struct {
                 const z = std.fmt.bufPrintZ(&buf, "{s}", .{cmd}) catch return;
                 sys.spawnDetached(z.ptr);
             },
-            .ame => |cmd| @import("../ipc.zig").runCommand(self.app, cmd),
+            .ame => |cmd| @import("../core/ipc.zig").runCommand(self.app, cmd),
             .close => if (fw) |w| {
                 // まず縮むアニメーション、縮み終わったら manage で close
                 w.closing = true;
@@ -715,6 +735,19 @@ pub const Wm = struct {
             .focus_window => |w| if (s) |ss| {
                 ss.focused = w;
                 ss.force_focus = true;
+            },
+            .show_window => |w| {
+                // 待っている間に閉じられた窓は無視する
+                if (std.mem.indexOfScalar(*Window, self.windows.items, w) == null or w.closing) return;
+                // 見えていなければ、その窓のワークスペースへ(Discord などの特別なワークスペースならそこ、複数なら一番左)
+                if (w.out) |oo| if (oo.tags & w.tags == 0) {
+                    const t = w.tags & (SCRATCH_TAG | 0x1ff);
+                    self.setTags(oo, if (t & SCRATCH_TAG != 0) SCRATCH_TAG else if (t != 0) t & (~t +% 1) else w.tags);
+                };
+                if (s) |ss| {
+                    ss.focused = w;
+                    ss.force_focus = true;
+                }
             },
         }
     }
@@ -912,10 +945,10 @@ pub const Wm = struct {
         }
     }
 
-    /// 壁紙が窓で覆われているか(タイルの窓・全画面の窓がある)
+    /// 壁紙が隠れているか(全画面の窓がある)。タイルの窓は透けていることがある(透明な端末など)ので止めない
     fn covered(self: *Wm, o: *WOut) bool {
         for (self.windows.items) |w| {
-            if (w.out == o and w.visible() and !w.closing and (!w.floating or w.fullscreen)) return true;
+            if (w.out == o and w.visible() and !w.closing and w.fullscreen) return true;
         }
         return false;
     }
@@ -1048,6 +1081,7 @@ pub const Wm = struct {
                     continue;
                 }
                 @import("../frame/island.zig").windowEvent(self.app, self.outputs.items, @intFromFloat(w.tx + w.tw / 2), @intFromFloat(w.ty + w.th / 2), true);
+                @import("../core/events.zig").emit(.{ .event = "window", .action = "open", .app_id = w.app_id[0..w.app_id_len] });
                 // 初めて表示: その場で「中心から広がる」(Hyprland の popin)
                 w.placed = true;
                 w.px.snap(w.tx);
@@ -1174,16 +1208,14 @@ pub const Wm = struct {
             const changed = ao.focused_tags != o.tags or ao.view_tags != occupied;
             ao.focused_tags = o.tags;
             ao.view_tags = occupied;
-            if (changed) {
-                if (ao.frame) |fr| fr.bar.tagsChanged(fr);
-                if (ao.bar) |b| b.tagsChanged();
-            }
+            if (changed) ao.tagsChanged();
         }
         const f = self.focusedWindow();
         const t: []const u8 = if (f) |w| w.titleStr() else "";
         if (!std.mem.eql(u8, t, app.focused_title.get())) {
             app.focused_title.set(t);
             app.title_serial +%= 1;
+            @import("../core/events.zig").emit(.{ .event = "focus", .title = t, .app_id = if (f) |w| w.app_id[0..w.app_id_len] else "" });
             for (app.outputs.items) |ao| {
                 if (ao.bar) |b| b.titleChanged();
                 if (ao.frame) |fr| fr.bar.titleChanged(fr);
@@ -1400,6 +1432,7 @@ fn wClosed(data: ?*anyopaque, obj: ?*c.struct_river_window_v1) callconv(.C) void
     const w: *Window = @ptrCast(@alignCast(data.?));
     const self = w.wm;
     if (w.placed) @import("../frame/island.zig").windowEvent(self.app, self.outputs.items, @intFromFloat(w.tx + w.tw / 2), @intFromFloat(w.ty + w.th / 2), false);
+    if (w.placed) @import("../core/events.zig").emit(.{ .event = "window", .action = "close", .app_id = w.app_id[0..w.app_id_len] });
     for (self.seats.items) |s| {
         // 次の manage で、このワークスペースで直前に使っていた窓へフォーカスが戻る
         if (s.focused == w) s.focused = null;
@@ -1601,6 +1634,8 @@ fn sPtrLeave(data: ?*anyopaque, _: ?*c.struct_river_seat_v1) callconv(.C) void {
 }
 fn sInteract(data: ?*anyopaque, _: ?*c.struct_river_seat_v1, win: ?*c.struct_river_window_v1) callconv(.C) void {
     const s: *WSeat = @ptrCast(@alignCast(data.?));
+    // 窓が押された: AI チャットが開いた直後のキーボードの独り占めを解く(その窓に入力できるように)
+    for (s.wm.app.outputs.items) |o| if (o.frame) |f| f.releaseAiGrab();
     if (s.wm.findWindow(win)) |w| s.wm.push(.{ .focus_window = w });
 }
 fn sShellInteract(_: ?*anyopaque, _: ?*c.struct_river_seat_v1, _: ?*c.struct_river_shell_surface_v1) callconv(.C) void {}
